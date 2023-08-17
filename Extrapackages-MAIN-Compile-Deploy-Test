@@ -1,0 +1,239 @@
+#!groovy
+def DELIVER_CHANGES_TO_RELEASE_STREAM_JOB = "Deliver-Changes-To-Release-Stream-MAIN";
+def Agent_label_1 = null
+def jdkversion = null
+def lscmhome = null
+def credentialsId = null
+def jenkins_propsId = null
+def targetLocation = null
+def mvnparams = null
+def params = null
+node('TBSharedRepo || STANDARD') {
+    stage('lableselection'){
+        retry(2){
+            
+            cleanWs() // Clean before build
+            checkout scm // We need to explicitly checkout from SCM here
+        }
+     def rtc_props = readProperties file: 'properties/OS_selection.properties'
+     env.build_Workspace1=rtc_props['windows']
+     def build_Workspace3 = build_Workspace1.split(",")
+     if (build_Workspace3.contains(getCompName())) {
+        Agent_label_1 = "STANDARD"
+        jdkversion = "11.0.16.1"
+        lscmhome = "lscm_7.0.2" 
+        credentialsId = "build_user"
+        jenkins_propsId = "globalclonedsettingsxmlId"
+        targetLocation = "D:/Workspace/Maven/MyGlobalClonedSettings.xml "
+        params = "deploy"
+        if (getCompName()=='ecl_alm_platform') {
+            params = "install"
+        }
+     } else {
+        Agent_label_1 = "$AGENT_LABEL"
+        jdkversion = "11.0.16.1_linux"
+        lscmhome = "LinuxLscm_7.0.2"
+        credentialsId = "ide3si"
+        jenkins_propsId = "globalclonedlinuxsettingsxmlId"
+        targetLocation = "."
+        params = "deploy"
+        mvnparams = "MyGlobalClonedLinuxSettings"
+		if (getCompName()=='ecl_cdgb') {
+            jenkins_propsId = "globallinuxsettingsxmlId"
+            mvnparams = "MyGlobalLinuxSettings"
+            params = "deploy -DnoTests=true -DskipTests=true"
+        } else if (getCompName()=='ecl_rtc_client_defecteval') {
+            params = "deploy -DnoTests=true"
+        } else if (getCompName()=='ecl_bfw_core_compile') {
+            params = "deploy -DnoTests=true"
+        } else (getCompName()=='Extrapackages-MAIN-Compile-Deploy-Test') {
+            params = "clean process-sources deploy -X"
+        } 
+      }
+	}  
+}
+pipeline {
+    agent {
+        label "$Agent_label_1" // It is a parameter passed from nightly builds for linux environments
+    }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '20'))
+    }
+	parameters {
+        string (
+            defaultValue: 'ecl_edapt,ecl_rhapsody,ecl_cantata,ecl_eva_rt',
+            name : 'extraPackages')
+		string (
+            defaultValue: 'ecl_rtc_client_utils_ibm',
+            name : 'ecl_rtc_client_utils_ibm')	
+		string (
+            defaultValue: '2023.2-rt',
+            name : 'branch.name')	
+		string (
+            defaultValue: '2023.2.0',
+            name : 'branch.version')
+		string (
+            defaultValue: '-Dtycho.localArtifacts=ignore -Drepository_Version=2023.2.0-SNAPSHOT -Dcdg_snapshots-URL=https://devops-tool-dev.de.bosch.com/nexus/content/repositories/snapshots/ -Dcdg_componentunzip-URL=https://devops-tool-dev.de.bosch.com/nexus/content/repositories/Snapshot-unzip/com/bosch/components -DskipTests=true -Ddeliver.changes.to.release.stream=true -Drelease_type=nightly',
+            name : 'NIGHTLY_PARAMS')
+	}		
+    tools { 
+        maven 'Maven-3.3.9' 
+		jdk jdkversion
+		ant '1.10.5'
+    }
+	environment {
+          diskCleanUp_home = tool name: 'diskCleanUp', type: 'com.cloudbees.jenkins.plugins.customtools.CustomTool'
+          //lscm_home = tool name: 'lscm_6.0.6', type: 'com.cloudbees.jenkins.plugins.customtools.CustomTool'
+          lscm_home = tool name: "$lscmhome", type: 'com.cloudbees.jenkins.plugins.customtools.CustomTool'
+    }
+	stages {
+        stage('CHECKOUT') {
+            steps {
+                script {
+                    /* if(NIGHTLY_PARAMS.contains("-Drelease_type=release")){ // Map Build workspace version
+                        PRODUCT_VERSION = RELEASE_VERSION; 
+                    } else {
+                        PRODUCT_VERSION = MAIN_VERSION;
+                    } */
+                    if (isUnix()) {
+                     NIGHTLY_PARAMS = NIGHTLY_PARAMS.replaceAll("-Dmaven.repo.local=.*",""); // Remove maven local repo parameter passed from nightly builds for linux environments
+                    }
+                    checkoutFn(true); // Calling Checkout Function
+                }
+            }
+        }	
+        stage('Pre Steps') {
+            steps {
+                script {
+                    def computerName = env.COMPUTERNAME
+                    build job: '2FA_Cleanup', parameters: [string(name: 'COMPUTERNAME', value: computerName)]
+                }
+            }
+        }
+ 	    stage('cleanup: Maven cleanup') {
+               when {  
+                     anyOf {
+                             expression { 
+                                return !isUnix()    
+                                }
+                            }                     
+                    } 
+            steps {
+                script{
+                    def rtc_props = readProperties file: 'properties/rtc_componentnameMapping.properties' 
+                    //used for rtc get revision
+                    env.build_Workspace=rtc_props[getCompName()+'.rtcComponentName']+'_MAIN Build Workspace'
+                    
+                    bat ("ant -lib ${WORKSPACE}/com.bosch.bbm.cbi.build.product/libs/ -lib C:\\toolbase\\ide_integration_sdk\\${IDE_INTEGRATION_SDK_VERSION}\\libs  -buildfile com.bosch.bbm.cbi.build.product/resources/scripts/rtc_get_Revision.xml  cleanup-maven-repo  -Dbuild_Workspace=\"${build_Workspace}\"")  
+                }
+            }
+              }  
+		stage('BUILD') {
+            steps {
+                script {
+                    try {
+                        buildFn(false,jenkins_propsId,targetLocation,mvnparams,params);
+                        stageRetry = false;
+                    }catch(err) {
+                        println "Build Exception : "+err;
+                        stageRetry = true;
+                    }
+                }
+            }
+        }
+	        stage('post steps') {
+            steps {
+                script {
+                    sh "mvn clean deploy ${NIGHTLY_PARAMS}"
+                }
+            }
+        }
+    }  
+     post {
+        always {
+            script {
+                build job: "${Job_name}", parameters: [string(name: 'NIGHTLY_PARAMS', value: env.NIGHTLY_PARAMS), string(name: 'STREAM_SUFFIX', value: env.STREAM_SUFFIX)], propagate: false, wait: false
+            }
+        }
+    }
+}
+def getCompName() {
+   def jobName   = env.JOB_NAME;
+   def compName = jobName.replace("-MAIN-Compile-Deploy-Test", "");
+   if (compName=='ecl_bfw_core')
+      {
+       compName=compName+'_compile'
+    }
+   echo "from function  ${compName}"
+   echo compName
+   return compName;
+} 
+def checkoutFn(def checkoutValidation) {
+    if(checkoutValidation) {
+        retry(2) {
+            cleanWs() // Clean before build
+            checkout scm // We need to explicitly checkout from SCM here
+        }
+        if (isUnix()) {
+           sh """
+               apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install tzdata
+               ln -snf /usr/share/zoneinfo/Europe/Berlin /etc/localtime && echo "Europe/Berlin" > /etc/timezone
+               dpkg-reconfigure --frontend noninteractive tzdata
+            """
+        } else {
+             try{
+                  bat("${diskCleanUp_home}/diskCleanUp.bat")
+               } 
+               catch(err) {
+                     echo "diskcleanup failed" 
+                   } 
+        }           
+        if(env.JOB_NAME=='ecl_ice_ara2lcore-MAIN-Compile-Deploy') {
+            def ecl_ice_ara2lcore_list=["product_build_MAIN Build Workspace","ecl_ice_ara2lcore_MAIN Build Workspace","ecl_ice_cdp_MAIN Build Workspace","ecl_ice_core_MAIN Build Workspace","ecl_ice_util_MAIN Build Workspace","ecl_ice_a2l_MAIN Build Workspace","ecl_ice_ara2l_templates_MAIN Build Workspace","ecl_ice_armemmap_MAIN Build Workspace"]
+            def jenkins_props = readProperties file: 'properties/jenkinscredentials.properties' 
+            for (String item : ecl_ice_ara2lcore_list) {
+                echo "checking out ${item}"
+                checkout([$class: 'RTCScm', avoidUsingToolkit: false, buildTool: 'RTC_6.0.5', buildType: [buildWorkspace: item, componentLoadConfig: 'loadAllComponents', customizedSnapshotName: '', loadDirectory: '', loadPolicy: 'useComponentLoadConfig', value: 'buildWorkspace'], credentialsId: jenkins_props['checkoutId'], overrideGlobal: false, serverURI: 'https://rb-ubk-clm-02.de.bosch.com:9443/ccm', timeout: 60])
+                echo "checking out ${item}  Completed"
+            }
+        }
+        def rtc_props = readProperties file: 'properties/rtc_componentnameMapping.properties'
+        def jenkins_props = readProperties file: 'properties/jenkinscredentials.properties'
+            
+        echo 'Slave context --------------------------------------------------------------------------------'
+        checkout([$class: 'RTCScm', avoidUsingToolkit: false, buildTool: 'RTC_6.0.5', buildType: [buildWorkspace: rtc_props[getCompName()+'.rtcComponentName']+"_$STREAM_SUFFIX Build Workspace", componentLoadConfig: 'loadAllComponents', customizedSnapshotName: '', loadDirectory: '', loadPolicy: 'useComponentLoadConfig', value: 'buildWorkspace'], credentialsId: jenkins_props['checkoutId'], overrideGlobal: false, serverURI: 'https://rb-ubk-clm-02.de.bosch.com:9443/ccm', timeout: 60])
+        
+        checkout([$class: 'RTCScm', avoidUsingToolkit: false, buildTool: 'RTC_6.0.5', buildType: [buildWorkspace: rtc_props['product_build.rtcComponentName']+'_MAIN Build Workspace', componentLoadConfig: 'loadAllComponents', customizedSnapshotName: '', loadDirectory: '', loadPolicy: 'useComponentLoadConfig', value: 'buildWorkspace'], credentialsId: jenkins_props['checkoutId'], overrideGlobal: false, serverURI: 'https://rb-ubk-clm-02.de.bosch.com:9443/ccm', timeout: 60])
+    }
+}
+def buildFn(def doCheckout,def jenkins_propsId,def targetLocation,def mvnparams,def params) {
+    checkoutFn(doCheckout);
+    if (getCompName()=='ecl_cdgb') {
+        sh 'ant -v -f com.bosch.bbm.cbi.build.product/resources/scripts/rename_CDGB.xml rename_cdgb'  // Prebuild
+    }
+
+    def tycho_props = readProperties file: 'properties/tycho_components.properties'
+    def jenkins_props = readProperties file: 'properties/jenkinscredentials.properties'
+
+    configFileProvider([configFile(fileId: jenkins_props["$jenkins_propsId"], targetLocation: "$targetLocation")]) {}
+    
+    // Below 2 lines are used before implementing maven central
+    // configFileProvider([configFile(fileId: jenkins_props['globallinuxsettingsxmlId'], targetLocation: '.')]) {}
+    // mvn -s ../MyGlobalLinuxSettings --update-snapshots clean deploy ${NIGHTLY_PARAMS}
+    dir(tycho_props[getCompName()]) {
+        if (getCompName()=='Extrapackages-MAIN-Compile-Deploy-Test') {         
+           NIGHTLY_PARAMS = NIGHTLY_PARAMS.replace("-Drepository_Version=2023.2.0","-Drepository_Version=${dependent_repository_Version.replace("-SNAPSHOT", "")}");
+        }
+        if (isUnix()) {
+         sh """       
+          mvn -s ../${mvnparams} ${params} ${NIGHTLY_PARAMS}
+         """
+        } else {
+            bat "mvn -s D:/Workspace/Maven/MyGlobalClonedSettings.xml --update-snapshots clean ${params} ${NIGHTLY_PARAMS}" 
+        }    
+          }
+    }
+ @NonCPS
+def getBuildUser() {
+    return currentBuild.rawBuild.getCause(Cause.UserIdCause)
+}	
